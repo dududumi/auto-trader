@@ -47,6 +47,7 @@ class Position:
     current_price: float   # USD 종목 소수점 보존을 위해 float
     pnl_pct: float
     currency: str = "KRW"  # "KRW" 또는 "USD"
+    pnl_amount: float = 0.0  # Toss API profitLoss.amount 그대로 (USD or KRW)
 
 
 @dataclass
@@ -344,54 +345,68 @@ class TossProvider(BaseProvider):
 
     def get_balance(self) -> Balance:
         headers = self._headers(with_account=True)
-        # 보유 종목
+        # 보유 종목 (스냅샷)
         resp = requests.get(f"{self.BASE_URL}/api/v1/holdings", headers=headers, timeout=10)
         resp.raise_for_status()
         data = resp.json().get("result", {})
-        raw_positions = []
+
+        raw_items: list[dict] = []
         for item in data.get("items", []):
             qty = float(item.get("quantity", 0) or 0)
             if qty <= 0:
                 continue
-            avg_p = float(item.get("averagePurchasePrice", 0) or 0)
-            cur_p = float(item.get("lastPrice", 0) or 0)
-            # API의 profitLoss.rate 단위가 불분명하므로 직접 계산 (avg_p 기준 수익률)
-            pnl = (cur_p - avg_p) / avg_p * 100 if avg_p > 0 else 0.0
-            raw_positions.append(Position(
-                symbol=item["symbol"],
-                name=item.get("name", ""),
-                quantity=qty,
-                avg_price=avg_p,
-                current_price=cur_p,
-                pnl_pct=round(pnl, 4),
-                currency=item.get("currency", "KRW"),
-            ))
-        # holdings lastPrice보다 /api/v1/prices가 더 실시간 → 한 번 더 조회해 current_price 갱신
-        if raw_positions:
-            syms = [p.symbol for p in raw_positions]
+            avg_p  = float(item.get("averagePurchasePrice", 0) or 0)
+            mv_amt = float((item.get("marketValue") or {}).get("amount", 0) or 0)
+            pl     = item.get("profitLoss") or {}
+            snap_p = mv_amt / qty if qty > 0 and mv_amt > 0 else float(item.get("lastPrice", 0) or 0)
+            raw_items.append({
+                "symbol":          item["symbol"],
+                "name":            item.get("name", ""),
+                "quantity":        qty,
+                "avg_price":       avg_p,
+                "currency":        item.get("currency", "KRW"),
+                "snap_price":      snap_p,
+                "snap_pnl_rate":   float(pl.get("rate", 0) or 0),
+                "snap_pnl_amount": float(pl.get("amount", 0) or 0),
+            })
+
+        # 실시간 현재가 (/api/v1/prices) — holdings 스냅샷보다 자주 갱신됨
+        live_prices: dict[str, float] = {}
+        if raw_items:
             try:
+                syms = ",".join(r["symbol"] for r in raw_items)
                 pr = requests.get(
                     f"{self.BASE_URL}/api/v1/prices",
                     headers=self._headers(),
-                    params={"symbols": ",".join(syms)},
+                    params={"symbols": syms},
                     timeout=10,
                 )
-                if pr.status_code == 200:
-                    price_map = {
-                        r.get("symbol", ""): float(r.get("lastPrice", 0) or 0)
-                        for r in pr.json().get("result", [])
-                    }
-                    for pos in raw_positions:
-                        fresh = price_map.get(pos.symbol, 0)
-                        if fresh > 0:
-                            pos.current_price = fresh
-                            pos.pnl_pct = round(
-                                (fresh - pos.avg_price) / pos.avg_price * 100, 4
-                            ) if pos.avg_price > 0 else 0.0
+                pr.raise_for_status()
+                for pi in pr.json().get("result", []):
+                    lp = float(pi.get("lastPrice", 0) or 0)
+                    if lp > 0:
+                        live_prices[pi["symbol"]] = lp
             except Exception:
-                pass  # 실패 시 holdings lastPrice 그대로 사용
+                pass
 
-        positions = raw_positions
+        positions: list[Position] = []
+        for r in raw_items:
+            cur_p = live_prices.get(r["symbol"]) or r["snap_price"]
+            avg_p = r["avg_price"]
+            qty   = r["quantity"]
+            if cur_p > 0 and avg_p > 0:
+                pnl_pct    = round((cur_p / avg_p - 1) * 100, 4)
+                pnl_amount = round((cur_p - avg_p) * qty, 2)
+            else:
+                pnl_pct    = round(r["snap_pnl_rate"] * 100, 4)
+                pnl_amount = r["snap_pnl_amount"]
+            positions.append(Position(
+                symbol=r["symbol"], name=r["name"],
+                quantity=qty, avg_price=avg_p,
+                current_price=cur_p,
+                pnl_pct=pnl_pct, pnl_amount=pnl_amount,
+                currency=r["currency"],
+            ))
         mv = data.get("marketValue", {}).get("amount", {})
         total_krw = int(float(mv.get("krw", 0) or 0))
         usd_market_value = float(mv.get("usd", 0) or 0)

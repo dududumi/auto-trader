@@ -204,17 +204,25 @@ def _portfolio_display():
         st.session_state["_balance"] = balance
         fx = balance.usd_to_krw or 0
 
+        # 매수환율 데이터 (로드된 경우 투자금액 계산에 사용)
+        _purchase_fx = st.session_state.get("_purchase_fx")
+
         # ── 투자 요약 계산 ────────────────────────────────────────────
         krw_invested = 0.0
         krw_market   = 0.0
         for p in balance.positions:
-            rate = fx if p.currency == "USD" else 1
-            krw_invested += p.avg_price    * p.quantity * rate
-            krw_market   += p.current_price * p.quantity * rate
+            if p.currency == "USD":
+                krw_market += p.current_price * p.quantity * fx
+                # 투자금액: 매수 당시 환율 기준 (있으면), 없으면 현재 환율
+                buy_fx = (_purchase_fx or {}).get(p.symbol, {}).get("wavg_fx") or fx
+                krw_invested += p.avg_price * p.quantity * buy_fx
+            else:
+                krw_invested += p.avg_price * p.quantity
+                krw_market   += p.current_price * p.quantity
         total_pnl     = krw_market - krw_invested
         total_pnl_pct = (total_pnl / krw_invested * 100) if krw_invested > 0 else 0.0
-        usd_in_krw    = int(balance.usd_market_value * fx) if fx else 0
-        grand_total   = balance.total_value + usd_in_krw
+        # 총 자산: 실시간 평가금액 + 예수금
+        grand_total   = int(krw_market) + balance.cash
 
         # ── 요약 카드 ─────────────────────────────────────────────────
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -253,7 +261,7 @@ def _portfolio_display():
             def _fmt_pnl(p) -> str:
                 icon = "🟢" if p.pnl_pct >= 0 else "🔴"
                 sign = "+" if p.pnl_pct >= 0 else ""
-                amt  = (p.current_price - p.avg_price) * p.quantity
+                amt  = p.pnl_amount  # Toss API profitLoss.amount (USD or KRW)
                 if p.currency == "USD":
                     krw_amt = int(amt * fx) if fx else 0
                     krw_str = f"  \n≈ ₩{krw_amt:+,}" if fx else ""
@@ -300,7 +308,6 @@ def _portfolio_display():
 
             krw_pos = [p for p in balance.positions if p.currency != "USD"]
             usd_pos = [p for p in balance.positions if p.currency == "USD"]
-            _purchase_fx = st.session_state.get("_purchase_fx")
 
             if krw_pos:
                 st.markdown("#### 🇰🇷 국내 주식")
