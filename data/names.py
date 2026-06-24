@@ -11,17 +11,68 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# 자주 쓰는 미국 주식 티커 → 이름
+# 미국 주식 티커 → 이름 (S&P 500 주요 종목 + 인기 ETF)
 _US_NAMES: dict[str, str] = {
-    "AAPL": "Apple", "MSFT": "Microsoft", "GOOGL": "Alphabet",
-    "AMZN": "Amazon", "META": "Meta", "NVDA": "NVIDIA",
-    "TSLA": "Tesla", "NFLX": "Netflix", "AMD": "AMD",
-    "INTC": "Intel", "QCOM": "Qualcomm", "AVGO": "Broadcom",
-    "TSM": "TSMC", "ASML": "ASML", "ORCL": "Oracle",
-    "CRM": "Salesforce", "ADBE": "Adobe", "PYPL": "PayPal",
+    # 빅테크
+    "AAPL": "Apple", "MSFT": "Microsoft", "GOOGL": "Alphabet", "GOOG": "Alphabet C",
+    "AMZN": "Amazon", "META": "Meta", "NVDA": "NVIDIA", "TSLA": "Tesla",
+    "NFLX": "Netflix", "UBER": "Uber", "LYFT": "Lyft", "SNAP": "Snap",
+    "TWTR": "Twitter", "PINS": "Pinterest", "RBLX": "Roblox", "U": "Unity",
+    # 반도체
+    "AMD": "AMD", "INTC": "Intel", "QCOM": "Qualcomm", "AVGO": "Broadcom",
+    "AMAT": "Applied Materials", "LRCX": "Lam Research", "KLAC": "KLA Corp",
+    "MRVL": "Marvell", "MPWR": "Monolithic Power", "ON": "ON Semiconductor",
+    "TXN": "Texas Instruments", "MU": "Micron", "WDC": "Western Digital",
+    "STX": "Seagate", "AEHR": "Aehr Test", "WOLF": "Wolfspeed",
+    "TSM": "TSMC", "ASML": "ASML", "SMCI": "Super Micro",
+    # 소프트웨어·클라우드
+    "ORCL": "Oracle", "CRM": "Salesforce", "ADBE": "Adobe", "NOW": "ServiceNow",
+    "WDAY": "Workday", "SNOW": "Snowflake", "DDOG": "Datadog", "MDB": "MongoDB",
+    "NET": "Cloudflare", "ZS": "Zscaler", "CRWD": "CrowdStrike", "PANW": "Palo Alto",
+    "FTNT": "Fortinet", "OKTA": "Okta", "PLTR": "Palantir", "PATH": "UiPath",
+    "AI": "C3.ai", "BBAI": "BigBear.ai", "SOUN": "SoundHound",
+    # 핀테크·결제
+    "PYPL": "PayPal", "SQ": "Block", "V": "Visa", "MA": "Mastercard",
+    "AXP": "American Express", "AFRM": "Affirm", "SOFI": "SoFi",
+    "COIN": "Coinbase", "HOOD": "Robinhood",
+    # 금융·은행
     "JPM": "JPMorgan", "BAC": "Bank of America", "GS": "Goldman Sachs",
-    "AMGN": "Amgen", "JNJ": "J&J", "PFE": "Pfizer",
-    "SPY": "S&P500 ETF", "QQQ": "NASDAQ100 ETF", "DIA": "Dow ETF",
+    "MS": "Morgan Stanley", "WFC": "Wells Fargo", "C": "Citigroup",
+    "BLK": "BlackRock", "SCHW": "Charles Schwab", "BRK.B": "Berkshire Hathaway B",
+    # 헬스케어·바이오
+    "JNJ": "J&J", "PFE": "Pfizer", "MRK": "Merck", "ABBV": "AbbVie",
+    "AMGN": "Amgen", "GILD": "Gilead", "BIIB": "Biogen", "REGN": "Regeneron",
+    "MRNA": "Moderna", "BNTX": "BioNTech", "LLY": "Eli Lilly",
+    "UNH": "UnitedHealth", "CVS": "CVS Health", "CI": "Cigna",
+    # 소비재·유통
+    "AMZN": "Amazon", "WMT": "Walmart", "TGT": "Target", "COST": "Costco",
+    "HD": "Home Depot", "LOW": "Lowe's", "SBUX": "Starbucks", "MCD": "McDonald's",
+    "NKE": "Nike", "LULU": "Lululemon", "TJX": "TJX", "ROST": "Ross Stores",
+    # 에너지
+    "XOM": "ExxonMobil", "CVX": "Chevron", "COP": "ConocoPhillips",
+    "SLB": "SLB", "EOG": "EOG Resources",
+    # 통신
+    "T": "AT&T", "VZ": "Verizon", "TMUS": "T-Mobile",
+    # 미디어·엔터
+    "DIS": "Disney", "CMCSA": "Comcast", "PARA": "Paramount", "WBD": "Warner Bros",
+    "SPOT": "Spotify",
+    # 항공·우주·방산
+    "BA": "Boeing", "LMT": "Lockheed Martin", "RTX": "Raytheon",
+    "NOC": "Northrop Grumman", "GD": "General Dynamics",
+    "AAL": "American Airlines", "UAL": "United Airlines", "DAL": "Delta",
+    "SPCE": "Virgin Galactic", "RKT": "Rocket Companies",
+    # 전기차·친환경
+    "RIVN": "Rivian", "LCID": "Lucid", "NIO": "NIO", "XPEV": "XPeng",
+    "LI": "Li Auto", "F": "Ford", "GM": "GM",
+    "ENPH": "Enphase", "SEDG": "SolarEdge", "FSLR": "First Solar",
+    # 부동산·리츠
+    "AMT": "American Tower", "PLD": "Prologis", "EQIX": "Equinix",
+    # ETF
+    "SPY": "S&P 500 ETF", "QQQ": "NASDAQ 100 ETF", "DIA": "Dow Jones ETF",
+    "IWM": "Russell 2000 ETF", "VTI": "Vanguard Total Market",
+    "VOO": "Vanguard S&P 500", "ARKK": "ARK Innovation", "SOXL": "반도체 3x ETF",
+    "TQQQ": "NASDAQ 3x ETF", "SQQQ": "NASDAQ -3x ETF",
+    "GLD": "Gold ETF", "SLV": "Silver ETF", "USO": "Oil ETF",
 }
 
 
@@ -70,3 +121,22 @@ def search_krx(query: str, limit: int = 10) -> list[dict]:
         if len(results) >= limit:
             break
     return results
+
+
+def search_us(query: str, limit: int = 8) -> list[dict]:
+    """미국 주식 티커/이름 검색."""
+    q = query.strip().upper()
+    if not q:
+        return []
+    results = []
+    for ticker, name in _US_NAMES.items():
+        if q in ticker or q in name.upper():
+            results.append({"code": ticker, "name": name, "label": f"{name} ({ticker})"})
+        if len(results) >= limit:
+            break
+    return results
+
+
+def is_us_symbol(symbol: str) -> bool:
+    """미국 주식 티커 여부 (숫자 6자리가 아니면 US로 간주)."""
+    return not symbol.strip().isdigit()

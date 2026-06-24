@@ -27,10 +27,10 @@ logger = logging.getLogger(__name__)
 class PriceInfo:
     symbol: str
     name: str
-    price: int
-    open: int
-    high: int
-    low: int
+    price: float         # KRX=원(정수), US=달러(소수 가능)
+    open: float
+    high: float
+    low: float
     volume: int
     change_pct: float
     per: float
@@ -42,10 +42,11 @@ class PriceInfo:
 class Position:
     symbol: str
     name: str
-    quantity: int
+    quantity: float        # 미국 소수점 매매(fractional shares) 대응
     avg_price: float
-    current_price: int
+    current_price: float   # USD 종목 소수점 보존을 위해 float
     pnl_pct: float
+    currency: str = "KRW"  # "KRW" 또는 "USD"
 
 
 @dataclass
@@ -53,6 +54,8 @@ class Balance:
     cash: int
     total_value: int
     positions: List[Position]
+    usd_market_value: float = 0.0  # USD 보유 평가금액 (달러)
+    usd_to_krw: float = 0.0        # 환율 (1 USD = ? KRW)
 
 
 @dataclass
@@ -184,17 +187,21 @@ class KISProvider(BaseProvider):
         )
         resp.raise_for_status()
         data = resp.json()
-        positions = [
-            Position(
+        positions = []
+        for item in data.get("output1", []):
+            qty = float(item.get("hldg_qty", 0) or 0)
+            if qty <= 0:
+                continue
+            avg_p = float(item.get("pchs_avg_pric", 0) or 0)
+            cur_p = float(item.get("prpr", 0) or 0)
+            pnl = (cur_p - avg_p) / avg_p * 100 if avg_p > 0 else 0.0
+            positions.append(Position(
                 symbol=item["pdno"], name=item["prdt_name"],
-                quantity=int(item["hldg_qty"] or 0),
-                avg_price=float(item["pchs_avg_pric"] or 0),
-                current_price=int(item["prpr"] or 0),
-                pnl_pct=float(item["evlu_pfls_rt"] or 0),
-            )
-            for item in data.get("output1", [])
-            if int(item.get("hldg_qty", 0) or 0) > 0
-        ]
+                quantity=qty,
+                avg_price=avg_p,
+                current_price=cur_p,
+                pnl_pct=round(pnl, 4),
+            ))
         o2 = data.get("output2", [{}])[0]
         return Balance(
             cash=int(o2.get("dnca_tot_amt", 0) or 0),
@@ -248,6 +255,7 @@ class TossProvider(BaseProvider):
         self.client_id = client_id
         self.client_secret = client_secret
         self.account_no = account_no
+        self._account_seq: Optional[int] = None   # X-Tossinvest-Account 에 사용
         self._token: Optional[str] = None
         self._token_expires: Optional[datetime] = None
         self._token_file = Path("toss_token.json")
@@ -269,6 +277,7 @@ class TossProvider(BaseProvider):
             return
         resp = requests.post(
             f"{self.BASE_URL}/oauth2/token",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
             data={
                 "grant_type": "client_credentials",
                 "client_id": self.client_id,
@@ -286,77 +295,305 @@ class TossProvider(BaseProvider):
             "expires": self._token_expires.isoformat(),
         }))
 
-    def _headers(self) -> dict:
-        self._ensure_token()
-        return {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
-
-    def get_price(self, symbol: str) -> PriceInfo:
-        time.sleep(0.12)
+    def _ensure_account_seq(self):
+        if self._account_seq is not None:
+            return
         resp = requests.get(
-            f"{self.BASE_URL}/v1/quotations/price",
-            headers=self._headers(),
-            params={"symbol": symbol},
+            f"{self.BASE_URL}/api/v1/accounts",
+            headers={"Authorization": f"Bearer {self._token}"},
             timeout=10,
         )
         resp.raise_for_status()
-        o = resp.json()
+        for acc in resp.json().get("result", []):
+            if acc.get("accountNo") == self.account_no:
+                self._account_seq = acc["accountSeq"]
+                return
+        # 계좌번호 매칭 실패 시 첫 번째 계좌 사용
+        accounts = resp.json().get("result", [])
+        if accounts:
+            self._account_seq = accounts[0]["accountSeq"]
+
+    def _headers(self, with_account: bool = False) -> dict:
+        self._ensure_token()
+        h = {"Authorization": f"Bearer {self._token}", "Content-Type": "application/json"}
+        if with_account:
+            self._ensure_account_seq()
+            if self._account_seq is not None:
+                h["X-Tossinvest-Account"] = str(self._account_seq)
+        return h
+
+    def get_price(self, symbol: str) -> PriceInfo:
+        from data.names import get_name
+        time.sleep(0.12)
+        resp = requests.get(
+            f"{self.BASE_URL}/api/v1/prices",
+            headers=self._headers(),
+            params={"symbols": symbol},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        result = resp.json().get("result", [])
+        o = result[0] if result else {}
+        price = float(o.get("lastPrice", 0) or 0)
+        name = (o.get("symbolName") or o.get("name") or "").strip() or get_name(symbol)
         return PriceInfo(
-            symbol=symbol, name=o.get("name", ""),
-            price=int(o.get("price", 0) or 0),
-            open=int(o.get("openPrice", 0) or 0),
-            high=int(o.get("highPrice", 0) or 0),
-            low=int(o.get("lowPrice", 0) or 0),
-            volume=int(o.get("volume", 0) or 0),
-            change_pct=float(o.get("changeRate", 0) or 0),
-            per=float(o.get("per", 0) or 0),
-            pbr=float(o.get("pbr", 0) or 0),
-            market_cap=int(o.get("marketCap", 0) or 0),
+            symbol=symbol, name=name,
+            price=price, open=0.0, high=0.0, low=0.0, volume=0,
+            change_pct=0.0, per=0.0, pbr=0.0, market_cap=0,
         )
 
     def get_balance(self) -> Balance:
-        resp = requests.get(
-            f"{self.BASE_URL}/v1/accounts/{self.account_no}/balance",
-            headers=self._headers(),
-            timeout=10,
-        )
+        headers = self._headers(with_account=True)
+        # 보유 종목
+        resp = requests.get(f"{self.BASE_URL}/api/v1/holdings", headers=headers, timeout=10)
         resp.raise_for_status()
-        data = resp.json()
-        positions = [
-            Position(
-                symbol=item["symbol"], name=item.get("name", ""),
-                quantity=int(item["quantity"] or 0),
-                avg_price=float(item["avgPrice"] or 0),
-                current_price=int(item["currentPrice"] or 0),
-                pnl_pct=float(item.get("pnlRate", 0) or 0),
+        data = resp.json().get("result", {})
+        raw_positions = []
+        for item in data.get("items", []):
+            qty = float(item.get("quantity", 0) or 0)
+            if qty <= 0:
+                continue
+            avg_p = float(item.get("averagePurchasePrice", 0) or 0)
+            cur_p = float(item.get("lastPrice", 0) or 0)
+            # API의 profitLoss.rate 단위가 불분명하므로 직접 계산 (avg_p 기준 수익률)
+            pnl = (cur_p - avg_p) / avg_p * 100 if avg_p > 0 else 0.0
+            raw_positions.append(Position(
+                symbol=item["symbol"],
+                name=item.get("name", ""),
+                quantity=qty,
+                avg_price=avg_p,
+                current_price=cur_p,
+                pnl_pct=round(pnl, 4),
+                currency=item.get("currency", "KRW"),
+            ))
+        # holdings lastPrice보다 /api/v1/prices가 더 실시간 → 한 번 더 조회해 current_price 갱신
+        if raw_positions:
+            syms = [p.symbol for p in raw_positions]
+            try:
+                pr = requests.get(
+                    f"{self.BASE_URL}/api/v1/prices",
+                    headers=self._headers(),
+                    params={"symbols": ",".join(syms)},
+                    timeout=10,
+                )
+                if pr.status_code == 200:
+                    price_map = {
+                        r.get("symbol", ""): float(r.get("lastPrice", 0) or 0)
+                        for r in pr.json().get("result", [])
+                    }
+                    for pos in raw_positions:
+                        fresh = price_map.get(pos.symbol, 0)
+                        if fresh > 0:
+                            pos.current_price = fresh
+                            pos.pnl_pct = round(
+                                (fresh - pos.avg_price) / pos.avg_price * 100, 4
+                            ) if pos.avg_price > 0 else 0.0
+            except Exception:
+                pass  # 실패 시 holdings lastPrice 그대로 사용
+
+        positions = raw_positions
+        mv = data.get("marketValue", {}).get("amount", {})
+        total_krw = int(float(mv.get("krw", 0) or 0))
+        usd_market_value = float(mv.get("usd", 0) or 0)
+        # 예수금 (매수가능금액)
+        cash = 0
+        try:
+            bp = requests.get(
+                f"{self.BASE_URL}/api/v1/buying-power",
+                headers=headers,
+                params={"currency": "KRW"},
+                timeout=10,
             )
-            for item in data.get("positions", [])
-        ]
+            bp.raise_for_status()
+            cash = int(float(bp.json().get("result", {}).get("cashBuyingPower", 0) or 0))
+        except Exception:
+            pass
+
+        # 환율 (USD → KRW)
+        usd_to_krw = 0.0
+        try:
+            fx = requests.get(
+                f"{self.BASE_URL}/api/v1/exchange-rate",
+                headers=self._headers(),
+                params={"baseCurrency": "USD", "quoteCurrency": "KRW"},
+                timeout=10,
+            )
+            fx.raise_for_status()
+            usd_to_krw = float(fx.json().get("result", {}).get("rate", 0) or 0)
+        except Exception:
+            pass
+
         return Balance(
-            cash=int(data.get("cash", 0) or 0),
-            total_value=int(data.get("totalValue", 0) or 0),
+            cash=cash,
+            total_value=total_krw + cash,
             positions=positions,
+            usd_market_value=usd_market_value,
+            usd_to_krw=usd_to_krw,
         )
 
+    def get_ohlcv(self, symbol: str, start: str, end: str | None = None) -> pd.DataFrame:
+        """토스 /api/v1/candles 로 일봉 OHLCV 조회 (최대 200봉)"""
+        candles = []
+        before = None
+        while True:
+            params: dict = {"symbol": symbol, "interval": "1d", "count": 200, "adjusted": "true"}
+            if before:
+                params["before"] = before
+            resp = requests.get(
+                f"{self.BASE_URL}/api/v1/candles",
+                headers=self._headers(),
+                params=params,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            result = resp.json().get("result", {})
+            batch = result.get("candles", [])
+            candles.extend(batch)
+            before = result.get("nextBefore")
+            if not before or not batch:
+                break
+            # start 날짜 이전 데이터까지만 수집
+            if batch[-1]["timestamp"][:10] <= start:
+                break
+
+        if not candles:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+        rows = []
+        for c in candles:
+            date = c["timestamp"][:10]
+            if date < start:
+                continue
+            if end and date > end:
+                continue
+            rows.append({
+                "date": date,
+                "open": float(c["openPrice"]),
+                "high": float(c["highPrice"]),
+                "low": float(c["lowPrice"]),
+                "close": float(c["closePrice"]),
+                "volume": float(c["volume"]),
+            })
+
+        if not rows:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+
+        df = pd.DataFrame(rows).sort_values("date")
+        df.index = pd.to_datetime(df["date"])
+        return df[["open", "high", "low", "close", "volume"]]
+
+    def get_us_purchase_fx(self) -> dict:
+        """
+        US 주식 종목별 매수 당시 USD/KRW 가중평균 환율.
+        /api/v1/orders?status=CLOSED 전체를 페이지네이션 수집 후
+        FinanceDataReader USD/KRW 히스토리로 매수일 환율 계산.
+
+        반환: {
+            symbol: {wavg_fx, min_fx, max_fx, buys, total_usd, total_krw_at_purchase}
+        }
+        """
+        from collections import defaultdict
+
+        self._ensure_token()
+        self._ensure_account_seq()
+
+        all_orders: list[dict] = []
+        cursor: Optional[str] = None
+        while True:
+            params: dict = {"status": "CLOSED"}
+            if cursor:
+                params["cursor"] = cursor
+            # 429 rate-limit 대응: 0.3s 기본, 429 시 2s 재시도
+            for attempt in range(3):
+                time.sleep(0.3 if attempt == 0 else 2.0)
+                resp = requests.get(
+                    f"{self.BASE_URL}/api/v1/orders",
+                    headers=self._headers(with_account=True),
+                    params=params,
+                    timeout=10,
+                )
+                if resp.status_code != 429:
+                    break
+            resp.raise_for_status()
+            data = resp.json().get("result", {})
+            all_orders.extend(data.get("orders", []))
+            if not data.get("hasNext"):
+                break
+            cursor = data.get("nextCursor")
+
+        # US BUY 주문 집계
+        us_buys: dict[str, list[dict]] = defaultdict(list)
+        all_dates: set[str] = set()
+        for o in all_orders:
+            sym = o.get("symbol", "")
+            if not sym.strip().isdigit() and o.get("side") == "BUY":
+                ex = o.get("execution") or {}
+                filled_qty = float(ex.get("filledQuantity") or 0)
+                filled_usd = float(ex.get("filledAmount") or 0)
+                filled_at = (ex.get("filledAt") or "")[:10]
+                if filled_qty > 0 and filled_at:
+                    us_buys[sym].append({"date": filled_at, "qty": filled_qty, "usd": filled_usd})
+                    all_dates.add(filled_at)
+
+        if not all_dates:
+            return {}
+
+        # USD/KRW 히스토리 (매수일 범위 전체)
+        min_year = min(all_dates)[:4]
+        today_str = datetime.today().strftime("%Y-%m-%d")
+        fx_df = fdr.DataReader("USD/KRW", f"{min_year}-01-01", today_str)
+        fx_df.index = fx_df.index.strftime("%Y-%m-%d")
+        fx_close = fx_df["Close"]
+
+        def _get_fx(date_str: str) -> Optional[float]:
+            if date_str in fx_close.index:
+                return float(fx_close[date_str])
+            avail = fx_close.index[fx_close.index <= date_str]
+            return float(fx_close[avail[-1]]) if len(avail) > 0 else None
+
+        result: dict[str, dict] = {}
+        for sym, buys in us_buys.items():
+            rates_w: list[tuple[float, float]] = []  # (usd_amount, fx_rate)
+            total_krw = 0.0
+            for b in buys:
+                fx = _get_fx(b["date"])
+                if fx:
+                    total_krw += b["usd"] * fx
+                    rates_w.append((b["usd"], fx))
+            if rates_w:
+                wavg = sum(r[0] * r[1] for r in rates_w) / sum(r[0] for r in rates_w)
+                fxs = [r[1] for r in rates_w]
+                result[sym] = {
+                    "wavg_fx": round(wavg),
+                    "min_fx": round(min(fxs)),
+                    "max_fx": round(max(fxs)),
+                    "buys": len(buys),
+                    "total_usd": sum(b["usd"] for b in buys),
+                    "total_krw_at_purchase": int(total_krw),
+                }
+
+        return result
+
     def place_order(self, symbol: str, side: str, quantity: int, price: int = 0) -> OrderResult:
+        order_type = "MARKET" if price == 0 else "LIMIT"
         payload: dict = {
-            "accountNo": self.account_no,
             "symbol": symbol,
             "side": side.upper(),
-            "quantity": quantity,
-            "orderType": "MARKET" if price == 0 else "LIMIT",
+            "orderType": order_type,
+            "quantity": str(quantity),   # 스펙: 문자열 정수
         }
         if price > 0:
-            payload["price"] = price
+            payload["price"] = str(price)
         try:
             resp = requests.post(
-                f"{self.BASE_URL}/v1/orders",
-                headers=self._headers(),
+                f"{self.BASE_URL}/api/v1/orders",
+                headers=self._headers(with_account=True),
                 json=payload,
                 timeout=10,
             )
             resp.raise_for_status()
-            data = resp.json()
-            return OrderResult(success=True, order_id=data.get("orderId", ""), message="주문 완료")
+            result = resp.json().get("result", {})
+            return OrderResult(success=True, order_id=result.get("orderId", ""), message="주문 완료")
         except Exception as e:
             return OrderResult(success=False, order_id="", message=str(e))
 

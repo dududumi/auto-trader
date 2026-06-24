@@ -25,7 +25,7 @@ class Config:
 
     # 공통
     anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
-    dart_api_key: str = field(default_factory=lambda: os.getenv("DART_API_KEY", ""))
+
     discord_webhook_url: str = field(default_factory=lambda: os.getenv("DISCORD_WEBHOOK_URL", ""))
 
     # 매매 설정

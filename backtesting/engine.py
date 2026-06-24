@@ -16,12 +16,15 @@ import numpy as np
 import pandas as pd
 import FinanceDataReader as fdr
 
+from data.names import is_us_symbol
 from indicators.technical import TechnicalSignals, calculate_signals
 
 logger = logging.getLogger(__name__)
 
-COMMISSION = 0.00015   # 매수·매도 수수료 0.015%
-SELL_TAX = 0.0020      # 증권거래세 0.20% (매도 시)
+KRX_COMMISSION = 0.00015   # 국내 수수료 0.015%
+KRX_SELL_TAX   = 0.0020    # 증권거래세 0.20% (매도 시, 국내 전용)
+US_COMMISSION   = 0.0       # 토스증권 미국주식 수수료 없음
+US_SELL_TAX     = 0.0       # 미국엔 증권거래세 없음
 
 
 # ─── 데이터 클래스 ────────────────────────────────────────────────────────────
@@ -59,6 +62,9 @@ class BacktestResult:
     daily_returns: pd.Series
     trades: List[Trade] = field(default_factory=list)
     benchmark_return_pct: float = 0.0
+    market: str = "KRX"        # "KRX" | "US"
+    currency: str = "KRW"      # "KRW" | "USD"
+    benchmark_name: str = "KOSPI"
 
 
 # ─── 내장 전략 ────────────────────────────────────────────────────────────────
@@ -127,8 +133,15 @@ class BacktestEngine:
     ) -> BacktestResult:
         fn = strategy_fn or BUILT_IN_STRATEGIES.get(strategy_name, _strategy_composite)
 
+        # 시장 자동 감지 (US 티커가 하나라도 있으면 US 모드)
+        market = "US" if any(is_us_symbol(s) for s in symbols) else "KRX"
+        commission = US_COMMISSION if market == "US" else KRX_COMMISSION
+        sell_tax   = US_SELL_TAX   if market == "US" else KRX_SELL_TAX
+        currency   = "USD"         if market == "US" else "KRW"
+        bench_code = "SPY"         if market == "US" else "KS11"
+        bench_name = "S&P 500"     if market == "US" else "KOSPI"
+
         cash = self.initial_capital
-        # symbol -> {qty, avg_price, buy_date}
         positions: dict[str, dict] = {}
         equity_records: list[dict] = []
         trades: List[Trade] = []
@@ -158,7 +171,6 @@ class BacktestEngine:
 
                 cur_price = float(df_slice["close"].iloc[-1])
 
-                # 보유 포지션 평가
                 if sym in positions:
                     portfolio_value += positions[sym]["qty"] * cur_price
 
@@ -167,9 +179,9 @@ class BacktestEngine:
                     loss = (cur_price - avg) / avg
                     if loss <= -stop_loss_pct:
                         qty = positions[sym]["qty"]
-                        net = cur_price * qty * (1 - SELL_TAX - COMMISSION)
+                        net = cur_price * qty * (1 - sell_tax - commission)
                         cash += net
-                        pnl = net - avg * qty * (1 + COMMISSION)
+                        pnl = net - avg * qty * (1 + commission)
                         trades.append(Trade(
                             date=current_date.strftime("%Y-%m-%d"),
                             symbol=sym, action="SELL",
@@ -179,7 +191,6 @@ class BacktestEngine:
                         del positions[sym]
                         continue
 
-                # 신호 계산
                 try:
                     sigs = calculate_signals(df_slice, sym)
                     action = fn(df_slice, sigs)
@@ -187,9 +198,11 @@ class BacktestEngine:
                     continue
 
                 if action == "BUY" and sym not in positions and len(positions) < max_positions:
-                    qty = int(portfolio_value * position_size_pct / cur_price)
+                    # US: 소수점 매매 허용 (0.001주 단위), KRX: 정수
+                    raw_qty = portfolio_value * position_size_pct / cur_price
+                    qty = round(raw_qty, 3) if market == "US" else int(raw_qty)
                     if qty > 0:
-                        cost = cur_price * qty * (1 + COMMISSION)
+                        cost = cur_price * qty * (1 + commission)
                         if cost <= cash:
                             cash -= cost
                             positions[sym] = {
@@ -206,10 +219,9 @@ class BacktestEngine:
 
                 elif action == "SELL" and sym in positions:
                     pos = positions[sym]
-                    proceeds = cur_price * pos["qty"]
-                    net = proceeds * (1 - SELL_TAX - COMMISSION)
+                    net = cur_price * pos["qty"] * (1 - sell_tax - commission)
                     cash += net
-                    pnl = net - pos["avg_price"] * pos["qty"] * (1 + COMMISSION)
+                    pnl = net - pos["avg_price"] * pos["qty"] * (1 + commission)
                     pnl_pct = (cur_price / pos["avg_price"] - 1) * 100
                     trades.append(Trade(
                         date=current_date.strftime("%Y-%m-%d"),
@@ -221,13 +233,13 @@ class BacktestEngine:
 
             equity_records.append({"date": current_date, "value": portfolio_value})
 
-        # 기간 종료 시 잔여 포지션 청산
+        # 기간 종료 잔여 포지션 청산
         for sym, pos in list(positions.items()):
             if sym in data:
                 last_price = float(data[sym]["close"].iloc[-1])
-                net = last_price * pos["qty"] * (1 - SELL_TAX - COMMISSION)
+                net = last_price * pos["qty"] * (1 - sell_tax - commission)
                 cash += net
-                pnl = net - pos["avg_price"] * pos["qty"] * (1 + COMMISSION)
+                pnl = net - pos["avg_price"] * pos["qty"] * (1 + commission)
                 trades.append(Trade(
                     date=end_date, symbol=sym, action="SELL",
                     price=last_price, quantity=pos["qty"], value=net,
@@ -241,17 +253,18 @@ class BacktestEngine:
             name="portfolio",
         )
 
-        # KOSPI 벤치마크
+        # 벤치마크 (국내=KOSPI, 미국=S&P 500 ETF)
         bench_ret = 0.0
         try:
-            kospi = fdr.DataReader("KS11", start_date, end_date)
-            bench_ret = float((kospi["Close"].iloc[-1] / kospi["Close"].iloc[0] - 1) * 100)
+            bench_df = fdr.DataReader(bench_code, start_date, end_date)
+            bench_ret = float((bench_df["Close"].iloc[-1] / bench_df["Close"].iloc[0] - 1) * 100)
         except Exception:
             pass
 
         return _calc_metrics(
             strategy_name, symbols, start_date, end_date,
             self.initial_capital, equity, trades, bench_ret,
+            market=market, currency=currency, benchmark_name=bench_name,
         )
 
 
@@ -264,6 +277,9 @@ def _calc_metrics(
     equity: pd.Series,
     trades: List[Trade],
     bench_ret: float,
+    market: str = "KRX",
+    currency: str = "KRW",
+    benchmark_name: str = "KOSPI",
 ) -> BacktestResult:
     if equity.empty or len(equity) < 2:
         equity = pd.Series([initial, initial])
@@ -307,4 +323,7 @@ def _calc_metrics(
         daily_returns=daily_rets,
         trades=trades,
         benchmark_return_pct=round(bench_ret, 2),
+        market=market,
+        currency=currency,
+        benchmark_name=benchmark_name,
     )
